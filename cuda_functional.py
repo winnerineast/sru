@@ -10,8 +10,6 @@ from pynvrtc.compiler import Program
 from collections import namedtuple
 
 
-tmp_ = torch.rand(1,1).cuda()
-
 SRU_CODE = """
 extern "C" {
 
@@ -20,12 +18,17 @@ extern "C" {
         return 1.f / (1.f + expf(-x));
     }
 
+    __forceinline__ __device__ float reluf(float x)
+    {
+        return (x > 0.f) ? x : 0.f;
+    }
+
     __global__ void sru_fwd(const float * __restrict__ u, const float * __restrict__ x,
                             const float * __restrict__ bias, const float * __restrict__ init,
                             const float * __restrict__ mask_h,
                             const int len, const int batch, const int d, const int k,
                             float * __restrict__ h, float * __restrict__ c,
-                            const int use_tanh)
+                            const int activation_type)
     {
         assert ((k == 3) || (x == NULL));
 
@@ -52,7 +55,9 @@ extern "C" {
             float g2 = sigmoidf((*(up+2))+bias2);
             cur = (cur-(*up))*g1 + (*up);
             *cp = cur;
-            float val = use_tanh ? tanh(cur) : cur;
+            float val = (activation_type == 1) ? tanh(cur) : (
+                (activation_type == 2) ? reluf(cur) : cur
+            );
             *hp = (val*mask-(*xp))*g2 + (*xp);
             up += ncols_u;
             xp += ncols_x;
@@ -68,7 +73,7 @@ extern "C" {
                             const int len, const int batch, const int d, const int k,
                             float * __restrict__ grad_u, float * __restrict__ grad_x,
                             float * __restrict__ grad_bias, float * __restrict__ grad_init,
-                            int use_tanh)
+                            int activation_type)
     {
         assert((k == 3) || (x == NULL));
         assert((k == 3) || (grad_x == NULL));
@@ -100,7 +105,10 @@ extern "C" {
             const float g1 = sigmoidf((*(up+1))+bias1);
             const float g2 = sigmoidf((*(up+2))+bias2);
 
-            const float c_val = use_tanh ? tanh(*cp) : (*cp);
+            const float c_val = (activation_type == 1) ? tanh(*cp) : (
+                (activation_type == 2) ? reluf(*cp) : (*cp)
+            );
+
             const float x_val = *xp;
             const float u_val = *up;
             const float prev_c_val = (row>0) ? (*(cp-ncols)) : (*(init+col));
@@ -119,7 +127,9 @@ extern "C" {
             gbias2 += gg2;
 
             // grad wrt c
-            const float tmp = use_tanh ? (g2*(1-c_val*c_val)) : g2;
+            const float tmp = (activation_type == 1) ? (g2*(1-c_val*c_val)) : (
+                ((activation_type == 0) || (c_val > 0)) ? g2 : 0.f
+            );
             const float gc = gh_val*mask*tmp + cur;
 
             // grad wrt u0
@@ -151,7 +161,7 @@ extern "C" {
                             const float * __restrict__ mask_h,
                             const int len, const int batch, const int d, const int k,
                             float * __restrict__ h, float * __restrict__ c,
-                            const int use_tanh)
+                            const int activation_type)
     {
         assert ((k == 3) || (x == NULL));
         assert ((k == 3) || (k == 4));
@@ -192,7 +202,9 @@ extern "C" {
             float g2 = sigmoidf((*(up+2))+bias2);
             cur = (cur-(*up))*g1 + (*up);
             *cp = cur;
-            float val = use_tanh ? tanh(cur) : cur;
+            float val = (activation_type == 1) ? tanh(cur) : (
+                (activation_type == 2) ? reluf(cur) : cur
+            );
             *hp = (val*mask-(*xp))*g2 + (*xp);
             up += ncols_u_;
             xp += ncols_x_;
@@ -209,7 +221,7 @@ extern "C" {
                             const int len, const int batch, const int d, const int k,
                             float * __restrict__ grad_u, float * __restrict__ grad_x,
                             float * __restrict__ grad_bias, float * __restrict__ grad_init,
-                            int use_tanh)
+                            int activation_type)
     {
         assert((k == 3) || (x == NULL));
         assert((k == 3) || (grad_x == NULL));
@@ -257,7 +269,9 @@ extern "C" {
             const float g1 = sigmoidf((*(up+1))+bias1);
             const float g2 = sigmoidf((*(up+2))+bias2);
 
-            const float c_val = use_tanh ? tanh(*cp) : (*cp);
+            const float c_val = (activation_type == 1) ? tanh(*cp) : (
+                (activation_type == 2) ? reluf(*cp) : (*cp)
+            );
             const float x_val = *xp;
             const float u_val = *up;
             const float prev_c_val = (cnt<len-1) ? (*(cp-ncols_)) : (*(init+col));
@@ -276,7 +290,9 @@ extern "C" {
             gbias2 += gg2;
 
             // grad wrt c
-            const float tmp = use_tanh ? (g2*(1-c_val*c_val)) : g2;
+            const float tmp = (activation_type == 1) ? (g2*(1-c_val*c_val)) : (
+                ((activation_type == 0) || (c_val > 0)) ? g2 : 0.f
+            );
             const float gc = gh_val*mask*tmp + cur;
 
             // grad wrt u0
@@ -305,25 +321,40 @@ extern "C" {
 }
 """
 
-SRU_PROG = Program(SRU_CODE.encode('utf-8'), 'sru_prog.cu'.encode('utf-8'))
-SRU_PTX = SRU_PROG.compile()
-SRU_MOD = function.Module()
-SRU_MOD.load(bytes(SRU_PTX.encode()))
-SRU_FWD_FUNC = SRU_MOD.get_function('sru_fwd')
-SRU_BWD_FUNC = SRU_MOD.get_function('sru_bwd')
-SRU_BiFWD_FUNC = SRU_MOD.get_function('sru_bi_fwd')
-SRU_BiBWD_FUNC = SRU_MOD.get_function('sru_bi_bwd')
 
-Stream = namedtuple('Stream', ['ptr'])
-SRU_STREAM = Stream(ptr=torch.cuda.current_stream().cuda_stream)
+class SRU_Compute_GPU(Function):
 
-class SRU_Compute(Function):
+    _SRU_PROG = Program(SRU_CODE.encode('utf-8'), 'sru_prog.cu'.encode())
+    _SRU_PTX = _SRU_PROG.compile()
+    _DEVICE2FUNC = {}
 
-    def __init__(self, use_tanh, d_out, bidirectional=False):
-        super(SRU_Compute, self).__init__()
-        self.use_tanh = use_tanh
+    def __init__(self, activation_type, d_out, bidirectional=False):
+        super(SRU_Compute_GPU, self).__init__()
+        self.activation_type = activation_type
         self.d_out = d_out
         self.bidirectional = bidirectional
+
+    def compile_functions(self):
+        device = torch.cuda.current_device()
+        print ('SRU loaded for gpu {}'.format(device))
+        mod = function.Module()
+        mod.load(bytes(self._SRU_PTX.encode()))
+        fwd_func = mod.get_function('sru_fwd')
+        bwd_func = mod.get_function('sru_bwd')
+        bifwd_func = mod.get_function('sru_bi_fwd')
+        bibwd_func = mod.get_function('sru_bi_bwd')
+
+        Stream = namedtuple('Stream', ['ptr'])
+        current_stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
+
+        self._DEVICE2FUNC[device] = (current_stream, fwd_func,
+            bifwd_func, bwd_func, bibwd_func
+        )
+        return current_stream, fwd_func, bifwd_func, bwd_func, bibwd_func
+
+    def get_functions(self):
+        res = self._DEVICE2FUNC.get(torch.cuda.current_device(), None)
+        return res if res else self.compile_functions()
 
     def forward(self, u, x, bias, init=None, mask_h=None):
         bidir = 2 if self.bidirectional else 1
@@ -334,14 +365,15 @@ class SRU_Compute(Function):
         k_ = k//2 if self.bidirectional else k
         ncols = batch*d*bidir
         thread_per_block = min(512, ncols)
-        num_block = (ncols-1)/thread_per_block+1
+        num_block = (ncols-1)//thread_per_block+1
 
         init_ = x.new(ncols).zero_() if init is None else init
         size = (length, batch, d*bidir) if x.dim() == 3 else (batch, d*bidir)
         c = x.new(*size)
         h = x.new(*size)
 
-        FUNC = SRU_FWD_FUNC if not self.bidirectional else SRU_BiFWD_FUNC
+        stream, fwd_func, bifwd_func, _, _ = self.get_functions()
+        FUNC = fwd_func if not self.bidirectional else bifwd_func
         FUNC(args=[
             u.contiguous().data_ptr(),
             x.contiguous().data_ptr() if k_ == 3 else 0,
@@ -354,9 +386,9 @@ class SRU_Compute(Function):
             k_,
             h.data_ptr(),
             c.data_ptr(),
-            self.use_tanh],
+            self.activation_type],
             block = (thread_per_block,1,1), grid = (num_block,1,1),
-            stream=SRU_STREAM
+            stream=stream
         )
 
         self.save_for_backward(u, x, bias, init, mask_h)
@@ -380,7 +412,7 @@ class SRU_Compute(Function):
         k_ = k//2 if self.bidirectional else k
         ncols = batch*d*bidir
         thread_per_block = min(512, ncols)
-        num_block = (ncols-1)/thread_per_block+1
+        num_block = (ncols-1)//thread_per_block+1
 
         init_ = x.new(ncols).zero_() if init is None else init
         grad_u = u.new(*u.size())
@@ -394,7 +426,8 @@ class SRU_Compute(Function):
         # Normal use
         grad_x = x.new(*x.size()) if k_ == 3 else None
 
-        FUNC = SRU_BWD_FUNC if not self.bidirectional else SRU_BiBWD_FUNC
+        stream, _, _, bwd_func, bibwd_func = self.get_functions()
+        FUNC = bwd_func if not self.bidirectional else bibwd_func
         FUNC(args=[
             u.contiguous().data_ptr(),
             x.contiguous().data_ptr() if k_ == 3 else 0,
@@ -412,23 +445,89 @@ class SRU_Compute(Function):
             grad_x.data_ptr() if k_ == 3 else 0,
             grad_bias.data_ptr(),
             grad_init.data_ptr(),
-            self.use_tanh],
+            self.activation_type],
             block = (thread_per_block,1,1), grid = (num_block,1,1),
-            stream=SRU_STREAM
+            stream=stream
         )
         return grad_u, grad_x, grad_bias.sum(1).view(-1), grad_init, None
 
 
+def SRU_Compute_CPU(activation_type, d, bidirectional=False):
+    """CPU version of the core SRU computation.
+
+    Has the same interface as SRU_Compute_GPU() but is a regular Python function
+    instead of a torch.autograd.Function because we don't implement backward()
+    explicitly.
+    """
+    def sru_compute_cpu(u, x, bias, init=None, mask_h=None):
+        bidir = 2 if bidirectional else 1
+        length = x.size(0) if x.dim() == 3 else 1
+        batch = x.size(-2)
+        k = u.size(-1) // d // bidir
+
+        if mask_h is None:
+            mask_h = 1
+
+        u = u.view(length, batch, bidir, d, k)
+
+        x_tilde = u[..., 0]
+
+        forget_bias, reset_bias = bias.view(2, bidir, d)
+        forget = (u[..., 1] + forget_bias).sigmoid()
+        reset = (u[..., 2] + reset_bias).sigmoid()
+
+        if k == 3:
+            x_prime = x.view(length, batch, bidir, d)
+        else:
+            x_prime = u[..., 3]
+
+        h = Variable(x.data.new(length, batch, bidir, d))
+
+        if init is None:
+            c_init = Variable(x.data.new(batch, bidir, d).zero_())
+        else:
+            c_init = init.view(batch, bidir, d)
+
+        c_final = []
+        for di in range(bidir):
+            if di == 0:
+                time_seq = range(length)
+            else:
+                time_seq = range(length - 1, -1, -1)
+
+            c_prev = c_init[:, di, :]
+            for t in time_seq:
+                c_t = (c_prev - x_tilde[t, :, di, :]) * forget[t, :, di, :] + x_tilde[t, :, di, :]
+                c_prev = c_t
+
+                if activation_type == 0:
+                    g_c_t = c_t
+                elif activation_type == 1:
+                    g_c_t = c_t.tanh()
+                elif activation_type == 2:
+                    g_c_t = nn.functional.relu(c_t)
+                else:
+                    assert False, 'Activation type must be 0, 1, or 2, not {}'.format(activation_type)
+
+                h[t, :, di, :] = (g_c_t * mask_h - x_prime[t, :, di, :]) * reset[t, :, di, :] + x_prime[t, :, di, :]
+
+            c_final.append(c_t)
+
+        return h.view(length, batch, -1), torch.stack(c_final, dim=1).view(batch, -1)
+
+    return sru_compute_cpu
+
+
 class SRUCell(nn.Module):
     def __init__(self, n_in, n_out, dropout=0, rnn_dropout=0,
-                use_tanh=1, bidirectional=False):
+                bidirectional=False, use_tanh=1, use_relu=0):
         super(SRUCell, self).__init__()
         self.n_in = n_in
         self.n_out = n_out
         self.rnn_dropout = rnn_dropout
         self.dropout = dropout
         self.bidirectional = bidirectional
-        self.use_tanh = use_tanh
+        self.activation_type = 2 if use_relu else (1 if use_tanh else 0)
 
         out_size = n_out*2 if bidirectional else n_out
         k = 4 if n_in != out_size else 3
@@ -472,14 +571,17 @@ class SRUCell(nn.Module):
         x_2d = x if x.dim() == 2 else x.contiguous().view(-1, n_in)
         u = x_2d.mm(self.weight)
 
+        if input.is_cuda:
+            SRU_Compute = SRU_Compute_GPU(self.activation_type, n_out, self.bidirectional)
+        else:
+            SRU_Compute = SRU_Compute_CPU(self.activation_type, n_out, self.bidirectional)
+
         if self.training and (self.dropout>0):
             bidir = 2 if self.bidirectional else 1
             mask_h = self.get_dropout_mask_((batch, n_out*bidir), self.dropout)
-            h, c = SRU_Compute(self.use_tanh, n_out, self.bidirectional)(u, input, self.bias, c0, mask_h)
+            return SRU_Compute(u, input, self.bias, c0, mask_h)
         else:
-            h, c = SRU_Compute(self.use_tanh, n_out, self.bidirectional)(u, input, self.bias, c0)
-
-        return h, c
+            return SRU_Compute(u, input, self.bias, c0)
 
     def get_dropout_mask_(self, size, p):
         w = self.weight.data
@@ -488,7 +590,7 @@ class SRUCell(nn.Module):
 
 class SRU(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers=2, dropout=0, rnn_dropout=0,
-                use_tanh=1, bidirectional=False):
+                bidirectional=False, use_tanh=1, use_relu=0, layer_norm=0):
         super(SRU, self).__init__()
         self.n_in = input_size
         self.n_out = hidden_size
@@ -496,7 +598,9 @@ class SRU(nn.Module):
         self.dropout = dropout
         self.rnn_dropout = rnn_dropout
         self.rnn_lst = nn.ModuleList()
+        self.ln_lst = nn.ModuleList()
         self.bidirectional = bidirectional
+        self.use_layer_norm = layer_norm
         self.out_size = hidden_size*2 if bidirectional else hidden_size
 
         for i in range(num_layers):
@@ -505,10 +609,13 @@ class SRU(nn.Module):
                 n_out = self.n_out,
                 dropout = dropout if i+1 != num_layers else 0,
                 rnn_dropout = rnn_dropout,
+                bidirectional = bidirectional,
                 use_tanh = use_tanh,
-                bidirectional = bidirectional
+                use_relu = use_relu,
             )
             self.rnn_lst.append(l)
+            if layer_norm:
+                self.ln_lst.append(LayerNorm(self.n_out))
 
     def set_bias(self, bias_val=0):
         for l in self.rnn_lst:
@@ -524,13 +631,13 @@ class SRU(nn.Module):
             c0 = [ zeros for i in range(self.depth) ]
         else:
             assert c0.dim() == 3    # (depth, batch, n_out*dir_)
-            c0 = c0.chunk(self.depth, 0)
+            c0 = [ x.squeeze(0) for x in c0.chunk(self.depth, 0) ]
 
         prevx = input
         lstc = []
         for i, rnn in enumerate(self.rnn_lst):
             h, c = rnn(prevx, c0[i])
-            prevx = h
+            prevx = self.ln_lst[i](h) if self.use_layer_norm else h
             lstc.append(c)
 
         if return_hidden:
@@ -538,4 +645,28 @@ class SRU(nn.Module):
         else:
             return prevx
 
+class LayerNorm(nn.Module):
+    '''
+    Layer normalization module modified from:
+    https://github.com/OpenNMT/OpenNMT-py/blob/master/onmt/modules/UtilClass.py
+    '''
 
+    def __init__(self, hidden_size, eps=1e-6):
+        super(LayerNorm, self).__init__()
+        self.eps = eps
+        self.a = nn.Parameter(torch.ones(hidden_size), requires_grad=True)
+        self.b = nn.Parameter(torch.zeros(hidden_size), requires_grad=True)
+
+    def forward(self, x):
+        if x.size(1) == 1:
+            return x
+        mu = torch.mean(x, dim=-1)
+        sigma = torch.std(x, dim=-1)
+        # HACK. PyTorch is changing behavior
+        if mu.dim() == x.dim()-1:
+            mu = mu.unsqueeze(mu.dim())
+            sigma = sigma.unsqueeze(sigma.dim())
+        output = (x - mu.expand_as(x)) / (sigma.expand_as(x) + self.eps)
+        output = output.mul(self.a.expand_as(output)) \
+            + self.b.expand_as(output)
+        return output
